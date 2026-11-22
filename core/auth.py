@@ -12,6 +12,7 @@ except Exception:
     HAS_BCRYPT = False
 
 ALL_MODULES = [
+    "⚡ Operations Action Center",
     "📊 Executive & Financial Analytics",
     "🧭 Multi-Channel Wave Research",
     "📥 Supplier Excel Import & Exclusions",

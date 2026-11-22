@@ -13,6 +13,7 @@ except Exception:
 
 ALL_MODULES = [
     "📊 Executive & Financial Analytics",
+    "🧭 Multi-Channel Wave Research",
     "📥 Supplier Excel Import & Exclusions",
     "🔫 Barcode Scan In / Out & Bins",
     "🏷️ Barcode & Shipping Label Printer",

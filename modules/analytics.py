@@ -151,7 +151,7 @@ def render(auth_user: dict):
                 title="Daily Gross Sales (Incl. VAT) vs Sales (Excl. VAT) & Net Profit",
             )
             st.plotly_chart(fig, use_container_width=True)
-            st.dataframe(df_ledger, use_container_width=True)
+            st.dataframe(df_ledger, use_container_width=True, hide_index=True)
         else:
             st.info("No records in `financial_ledger` yet.")
 

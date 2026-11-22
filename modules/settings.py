@@ -65,7 +65,7 @@ def render(auth_user: dict):
         ch_table_df = run_query(
             "SELECT id, channel_name, api_url, api_endpoint, is_active, last_connection_test FROM channel_credentials"
         )
-        st.dataframe(ch_table_df, use_container_width=True)
+        st.dataframe(ch_table_df, use_container_width=True, hide_index=True)
         with st.form("upsert_channel_cred"):
             st.markdown("**Add / Update Channel Credential (`channel_credentials`)**")
             cc1, cc2, cc3 = st.columns(3)

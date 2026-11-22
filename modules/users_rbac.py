@@ -24,7 +24,7 @@ def render(auth_user: dict):
             FROM app_users
             ORDER BY id
         """)
-        st.dataframe(users_df, use_container_width=True)
+        st.dataframe(users_df, use_container_width=True, hide_index=True)
 
         roles_df = run_query("SELECT role_id, role_name FROM app_roles")
         role_map = dict(zip(roles_df["role_id"], roles_df["role_name"])) if not roles_df.empty else {"admin": "Admin", "operator": "Operator"}

@@ -1,3 +1,4 @@
+from core.ui_helpers import stage_items_to_sellerflex
 from datetime import datetime
 import pandas as pd
 import streamlit as st
@@ -10,58 +11,96 @@ from services.ecomm_research_engine import (
     load_mysql_as_research_inputs,
     run_multichannel_research_pipeline,
 )
+from services.profitability_engine import (
+    compute_profitability_dataframe,
+    get_default_configs,
+    save_profitability_to_mysql,
+)
 
 
 def render(auth_user: dict):
     current_user = auth_user["username"]
-    st.title("🧭 Multi-Channel Full-Year Research & 10-Wave Planner")
+    st.title("🧭 Multi-Channel Research & Wave Planner")
     st.caption(
-        "Classifies inventory across all 10 South African retail waves (W01 Back-to-School → W10 Evergreen), "
-        "filters restricted consumables/pet food, scores channel fit (Amazon, Takealot, Takeazon), "
-        "prioritizes Seller Flex expansion candidates, and audits existing Seller1 stock levels."
+        "Plan seasonal assortments across all 10 South African retail waves, filter restricted consumables, "
+        "score channel fit (Amazon, Takealot, Takeazon), and price + stage Seller Flex expansion SKUs end-to-end."
     )
 
+    st.session_state.setdefault("res_min_stock", 100)
+    st.session_state.setdefault("res_flex_target", 1000)
+    st.session_state.setdefault("res_disc_pct", 20.0)
+    st.session_state.setdefault("res_excl_cons", True)
+
+    # Quick-Apply Strategy Presets
+    st.markdown("##### ⚡ Quick Strategy Presets")
+    p1, p2, p3 = st.columns(3)
+    if p1.button("🎄 Peak Q4 / Festive Push", use_container_width=True, help=">100 stock, 1,000 Seller Flex SKUs, 20% promo discount"):
+        st.session_state["res_min_stock"] = 100
+        st.session_state["res_flex_target"] = 1000
+        st.session_state["res_disc_pct"] = 20.0
+        st.session_state["res_excl_cons"] = True
+        st.rerun()
+    if p2.button("📦 High-Depth Core Replenishment", use_container_width=True, help=">250 stock buffer for steady multi-channel stock"):
+        st.session_state["res_min_stock"] = 250
+        st.session_state["res_flex_target"] = 500
+        st.session_state["res_disc_pct"] = 15.0
+        st.session_state["res_excl_cons"] = True
+        st.rerun()
+    if p3.button("🔍 Full Catalog Low-Threshold Scan", use_container_width=True, help="Scan all items with >20 units in stock"):
+        st.session_state["res_min_stock"] = 20
+        st.session_state["res_flex_target"] = 1500
+        st.session_state["res_disc_pct"] = 20.0
+        st.session_state["res_excl_cons"] = True
+        st.rerun()
+
+    st.divider()
+
+    # Step 1: Choose Input Source
+    st.markdown("##### Step 1 · Choose Inventory Source")
     data_source = st.radio(
-        "Select Research Input Source",
+        "Data Source",
         [
-            "1. Live MySQL Database (`inventory_items` + `amazon_active_listings` + `inventory_item_profitability`)",
-            "2. Upload Seller1 & Seller2 Spreadsheets (.xlsx / .csv)",
+            "Live ERP Database (Recommended — uses current MySQL stock & profitability prices)",
+            "Upload Custom Spreadsheets (Seller1 Existing Listings + Seller2 Supplier Catalog)",
         ],
         horizontal=True,
+        label_visibility="collapsed",
     )
 
     df1_in = None
     df2_in = None
 
-    if data_source.startswith("2."):
+    if data_source.startswith("Upload"):
         up1, up2 = st.columns(2)
         with up1:
-            f1 = st.file_uploader("Upload Seller1 File (Existing Amazon Listings)", type=["xlsx", "xls", "csv"], key="res_s1_file")
+            f1 = st.file_uploader("Seller1 File (Existing Amazon Listings)", type=["xlsx", "xls", "csv"], key="res_s1_file")
             if f1 is not None:
                 fb1 = f1.getvalue()
                 sh1 = "CSV" if f1.name.lower().endswith(".csv") else get_excel_sheet_names(fb1)[0]
                 df1_in = load_uploaded_spreadsheet(fb1, f1.name, sh1)
-                st.caption(f"Loaded `{f1.name}` ({len(df1_in):,} rows)")
+                st.success(f"Loaded `{f1.name}` ({len(df1_in):,} rows)")
         with up2:
-            f2 = st.file_uploader("Upload Seller2 File (Supplier / Master Catalog)", type=["xlsx", "xls", "csv"], key="res_s2_file")
+            f2 = st.file_uploader("Seller2 File (Supplier / Master Catalog)", type=["xlsx", "xls", "csv"], key="res_s2_file")
             if f2 is not None:
                 fb2 = f2.getvalue()
                 sh2 = "CSV" if f2.name.lower().endswith(".csv") else get_excel_sheet_names(fb2)[0]
                 df2_in = load_uploaded_spreadsheet(fb2, f2.name, sh2)
-                st.caption(f"Loaded `{f2.name}` ({len(df2_in):,} rows)")
+                st.success(f"Loaded `{f2.name}` ({len(df2_in):,} rows)")
 
+    # Step 2: Configure Parameters
+    st.markdown("##### Step 2 · Configure Filtering & Discount Rules")
     c1, c2, c3, c4 = st.columns(4)
-    min_stock = c1.number_input("Min Eligible Stock Threshold", min_value=0, value=100, step=10)
-    flex_target = c2.number_input("Amazon Flex Target SKU Count", min_value=10, max_value=5000, value=1000, step=50)
-    disc_pct = c3.number_input("Promo Discount %", min_value=0.0, max_value=90.0, value=20.0, step=1.0) / 100.0
-    excl_cons = c4.checkbox("Exclude Sweets, Candy & Pet Food", value=True)
+    min_stock = c1.number_input("Min Eligible Stock", min_value=0, step=10, key="res_min_stock")
+    flex_target = c2.number_input("Seller Flex Target SKUs", min_value=10, max_value=5000, step=50, key="res_flex_target")
+    disc_pct = c3.number_input("Promo Discount (%)", min_value=0.0, max_value=90.0, step=1.0, key="res_disc_pct") / 100.0
+    excl_cons = c4.checkbox("Exclude Candy & Pet Food", key="res_excl_cons")
 
-    ready = data_source.startswith("1.") or (df1_in is not None and df2_in is not None)
+    ready = data_source.startswith("Live") or (df1_in is not None and df2_in is not None)
 
-    if st.button("🚀 Run Multi-Channel Full-Year Research", type="primary", disabled=not ready):
+    if st.button("🚀 Generate Multi-Channel Research Plan", type="primary", disabled=not ready, use_container_width=True):
         try:
-            with st.spinner("Running 10-wave classification, MySQL pricing lookup & stock audit..."):
-                if data_source.startswith("1."):
+            with st.spinner("Classifying 10 SA retail waves, matching MySQL prices & auditing stock..."):
+                if data_source.startswith("Live"):
                     df1_in, df2_in = load_mysql_as_research_inputs()
                 results = run_multichannel_research_pipeline(
                     df1_in=df1_in,
@@ -72,10 +111,11 @@ def render(auth_user: dict):
                     exclude_consumables=excl_cons,
                 )
                 st.session_state["ecomm_research_results"] = results
-                st.success("Multi-channel full-year research completed!")
+                st.session_state.pop("research_pushed_summary", None)
         except Exception as exc:
             st.error(f"Research pipeline error: {exc}")
 
+    # Step 3: Interactive Results & End-to-End Push
     if "ecomm_research_results" in st.session_state:
         res = st.session_state["ecomm_research_results"]
         waves_df: pd.DataFrame = res["annual_wave_summary"]
@@ -83,76 +123,163 @@ def render(auth_user: dict):
         master_df: pd.DataFrame = res["multichannel_master"]
         audit_df: pd.DataFrame = res["audit"]
 
+        st.divider()
+        st.markdown("##### Step 3 · Review Insights, Price & Push End-to-End")
+
+        low_stock_alerts = int(audit_df["Stock_Status"].astype(str).str.startswith("ALERT").sum()) if not audit_df.empty else 0
         m1, m2, m3, m4 = st.columns(4)
         m1.metric(f"Eligible SKUs (>{min_stock} Stock)", f"{len(master_df):,}")
-        m2.metric("Amazon Flex Candidates", f"{len(flex_df):,}")
+        m2.metric("Seller Flex Shortlist", f"{len(flex_df):,}")
         m3.metric("Excluded Consumables", f"{res['excluded_count']:,}")
-        low_stock_alerts = int(audit_df["Stock_Status"].astype(str).str.startswith("ALERT").sum()) if not audit_df.empty else 0
-        m4.metric("Seller1 Low-Stock Alerts", f"{low_stock_alerts:,}")
+        m4.metric("Existing Listing Alerts", f"{low_stock_alerts:,}", delta_color="inverse")
 
         excel_bytes = build_research_excel_bytes(res)
         today_str = datetime.now().strftime("%d-%m-%Y")
         st.download_button(
-            "⬇️ Download Full 4-Sheet Research Workbook (`multichannel_full_year_research.xlsx`)",
+            "⬇️ Download Complete 4-Tab Excel Report (.xlsx)",
             data=excel_bytes,
             file_name=f"multichannel_full_year_research_{today_str}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="secondary",
         )
 
-        st.divider()
         t_waves, t_flex, t_master, t_audit = st.tabs([
-            "🌊 SA Annual 10 Retail Waves",
-            f"🚚 Amazon Seller Flex Import ({len(flex_df):,})",
-            f"🌐 All Channels Master ({len(master_df):,})",
-            f"🔍 Seller1 Stock Audit ({len(audit_df):,})",
+            "🌊 10 Retail Waves Summary",
+            f"🚚 Seller Flex Shortlist ({len(flex_df):,})",
+            f"🌐 Master Channel Catalog ({len(master_df):,})",
+            f"🔍 Existing Stock Audit ({len(audit_df):,})",
         ])
 
         with t_waves:
-            st.dataframe(waves_df, use_container_width=True)
+            st.dataframe(waves_df, use_container_width=True, hide_index=True)
 
         with t_flex:
-            st.caption("Prioritizes immediate Q4/Q1 waves (W07, W08, W09, W01) and key brands first, excluding pack-only SKUs and capping quantity at 500.")
-            st.dataframe(flex_df, use_container_width=True, height=450)
+            st.info(
+                "Prioritizes immediate seasonal waves (W07, W08, W09, W01) and key brands first, capping stock at 500 units per SKU."
+            )
+            sf_search = st.text_input(
+                "Search Seller Flex Shortlist",
+                placeholder="Filter by SKU, product name, or wave...",
+                key="sf_shortlist_search",
+            )
+            view_flex = flex_df.copy()
+            if sf_search.strip():
+                q = sf_search.strip().lower()
+                view_flex = view_flex[
+                    view_flex["SKU"].astype(str).str.lower().str.contains(q, na=False)
+                    | view_flex["Product Name"].astype(str).str.lower().str.contains(q, na=False)
+                    | view_flex["SA_Annual_Wave (Reference)"].astype(str).str.lower().str.contains(q, na=False)
+                ]
+            st.dataframe(view_flex, use_container_width=True, height=420, hide_index=True)
 
+            can_edit_prof = has_perm(auth_user, "edit_profitability") or auth_user["flags"].get("can_save_profitability", False)
             can_push_sf = has_perm(auth_user, "sync_amazon_finances") or auth_user["flags"].get("can_live_sync", False)
-            if not flex_df.empty and can_push_sf:
-                if st.button("📥 Stage Selected Candidates into `sellerflex_inventory` Table"):
+
+            if not flex_df.empty:
+                st.markdown("#### 🚀 End-to-End Automation: Price & Stage Shortlist")
+                b_col1, b_col2 = st.columns(2)
+
+                # ONE-CLICK END-TO-END: Compute Profitability Matrix + Save to MySQL + Stage into Seller Flex
+                if b_col1.button(
+                    "💰 Price & Push Shortlist Directly to Profitability Matrix",
+                    type="primary",
+                    disabled=not can_edit_prof,
+                    use_container_width=True,
+                    help="Computes adaptive-margin pricing for all shortlisted SKUs, saves to MySQL, updates the Profitability Matrix, and stages them for Seller Flex sync.",
+                ):
                     try:
-                        with engine.begin() as conn:
-                            rows_to_insert = [
-                                {
-                                    "sku": str(r["SKU"]).strip(),
-                                    "qty": int(r["Qty"]),
-                                }
-                                for _, r in flex_df.iterrows()
-                            ]
-                            for i in range(0, len(rows_to_insert), 500):
-                                conn.execute(
-                                    text("""
-                                        INSERT INTO sellerflex_inventory (sku, available_qty, sync_status)
-                                        VALUES (:sku, :qty, 'PENDING')
-                                        ON DUPLICATE KEY UPDATE available_qty = VALUES(available_qty), sync_status = 'PENDING'
-                                    """),
-                                    rows_to_insert[i : i + 500],
-                                )
-                        log_audit(
-                            current_user,
-                            "STAGE_SELLERFLEX_RESEARCH",
-                            "Staged Seller Flex candidates from Research Planner",
-                            f"Staged {len(flex_df):,} SKUs into sellerflex_inventory",
-                            len(flex_df),
-                        )
-                        st.success(f"Staged **{len(flex_df):,}** SKUs into `sellerflex_inventory` (ready to sync in Channel Profitability & Listings → SellerFlex Sync).")
+                        with st.spinner(f"Pricing {len(flex_df):,} shortlisted SKUs & updating Profitability Matrix + Seller Flex queue..."):
+                            if "prof_mp_cfg" not in st.session_state or "prof_global_cfg" not in st.session_state:
+                                mp_def, g_def = get_default_configs()
+                                st.session_state["prof_mp_cfg"] = mp_def
+                                st.session_state["prof_global_cfg"] = g_def
+
+                            mp_cfg = st.session_state["prof_mp_cfg"]
+                            g_cfg = st.session_state["prof_global_cfg"]
+
+                            # Compute fresh full profitability matrix from inventory_items
+                            full_prof_df = compute_profitability_dataframe(
+                                mp_configs=mp_cfg,
+                                global_configs=g_cfg,
+                                preserve_existing_overrides=True,
+                            )
+
+                            shortlist_skus = {str(s).strip() for s in flex_df["SKU"].tolist() if str(s).strip()}
+                            shortlist_prof = full_prof_df[full_prof_df["sku"].astype(str).str.strip().isin(shortlist_skus)].copy()
+
+                            if not shortlist_prof.empty:
+                                save_profitability_to_mysql(shortlist_prof, triggered_by=current_user)
+                                st.session_state["prof_df"] = full_prof_df
+
+                            # Build price lookup from calculated matrix so Seller Flex queue has live prices immediately
+                            price_lookup = {}
+                            if not shortlist_prof.empty:
+                                for _, pr in shortlist_prof.iterrows():
+                                    act_p = pd.to_numeric(pr.get("amazon_actual_price"), errors="coerce")
+                                    rec_p = pd.to_numeric(pr.get("amazon_rec_price"), errors="coerce")
+                                    chosen_p = act_p if (pd.notna(act_p) and act_p > 0) else (rec_p if pd.notna(rec_p) else 0.0)
+                                    price_lookup[str(pr["sku"]).strip()] = round(float(chosen_p), 2)
+
+                            # Update in-memory flex_df with newly calculated prices
+                            updated_flex = flex_df.copy()
+                            disc_mult = max(0.0, 1.0 - float(disc_pct))
+                            updated_flex["Amazon Price"] = updated_flex["SKU"].astype(str).str.strip().map(
+                                lambda s: price_lookup.get(s) if price_lookup.get(s, 0) > 0 else None
+                            )
+                            updated_flex["20% Dicount Price"] = (
+                                pd.to_numeric(updated_flex["Amazon Price"], errors="coerce") * disc_mult
+                            ).round(2)
+                            res["amazon_flex_import"] = updated_flex
+                            st.session_state["ecomm_research_results"] = res
+
+                            # Stage into sellerflex_inventory
+                            stage_items_to_sellerflex([(str(r["SKU"]).strip(), int(r["Qty"])) for _, r in flex_df.iterrows()])
+
+                            log_audit(
+                                current_user,
+                                "RESEARCH_TO_PROFITABILITY_AND_SF",
+                                "Priced and staged Seller Flex shortlist end-to-end",
+                                f"Priced {len(shortlist_prof):,} SKUs in MySQL & staged {len(updated_flex):,} SKUs in sellerflex_inventory",
+                                len(updated_flex),
+                            )
+                            st.session_state["research_pushed_summary"] = {
+                                "priced_count": len(shortlist_prof),
+                                "staged_count": len(updated_flex),
+                            }
+                            st.rerun()
+                    except Exception as exc:
+                        st.error(f"End-to-end push failed: {exc}")
+
+                # Stage-only button (without recalculating prices)
+                if b_col2.button(
+                    "📥 Stage Quantities Only into `sellerflex_inventory`",
+                    disabled=not can_push_sf,
+                    use_container_width=True,
+                ):
+                    try:
+                        stage_items_to_sellerflex([(str(r["SKU"]).strip(), int(r["Qty"])) for _, r in flex_df.iterrows()])
+                        st.success(f"Staged **{len(flex_df):,}** SKUs into `sellerflex_inventory` (`PENDING`).")
                     except Exception as exc:
                         st.error(f"Could not stage into `sellerflex_inventory`: {exc}")
 
+                if "research_pushed_summary" in st.session_state:
+                    ps = st.session_state["research_pushed_summary"]
+                    st.success(
+                        f"End-to-end pipeline complete: **{ps['priced_count']:,}** SKUs priced & saved to `inventory_item_profitability` "
+                        f"and **{ps['staged_count']:,}** SKUs staged in `sellerflex_inventory` (`PENDING`)."
+                    )
+                    if st.button("➡️ Open Channel Profitability & Seller Flex Sync Now", type="primary"):
+                        st.session_state["nav_override_page"] = "🛒 Channel Profitability & Listings"
+                        st.rerun()
+
         with t_master:
             if not master_df.empty:
-                f_col1, f_col2 = st.columns(2)
+                f1, f2, f3 = st.columns([1.4, 1.2, 1.4])
                 wave_opts = ["ALL"] + sorted(master_df["SA_Annual_Wave"].dropna().unique().tolist())
-                sel_wave = f_col1.selectbox("Filter by SA Retail Wave", wave_opts)
+                sel_wave = f1.selectbox("Retail Wave", wave_opts)
                 fit_opts = ["ALL", "Amazon Fit (Yes)", "Takealot Fit (Yes)", "Takeazon Fit (Yes)"]
-                sel_fit = f_col2.selectbox("Filter by Channel Fit", fit_opts)
+                sel_fit = f2.selectbox("Channel Fit", fit_opts)
+                kw_search = f3.text_input("Keyword / SKU Search", placeholder="e.g., INTEX, LEGO, 006-...")
 
                 filt_master = master_df.copy()
                 if sel_wave != "ALL":
@@ -163,10 +290,21 @@ def render(auth_user: dict):
                     filt_master = filt_master[filt_master["Takealot_Fit"].astype(str).str.startswith("Yes")]
                 elif sel_fit == "Takeazon Fit (Yes)":
                     filt_master = filt_master[filt_master["Takeazon_Fit"].astype(str).str.startswith("Yes")]
+                if kw_search.strip():
+                    q = kw_search.strip().lower()
+                    filt_master = filt_master[
+                        filt_master["Item"].astype(str).str.lower().str.contains(q, na=False)
+                        | filt_master["Description"].astype(str).str.lower().str.contains(q, na=False)
+                    ]
 
-                st.dataframe(filt_master, use_container_width=True, height=480)
+                st.caption(f"Showing **{len(filt_master):,}** of **{len(master_df):,}** eligible SKUs")
+                st.dataframe(filt_master, use_container_width=True, height=460, hide_index=True)
             else:
                 st.info("No eligible SKUs matched the current stock threshold.")
 
         with t_audit:
-            st.dataframe(audit_df, use_container_width=True, height=480)
+            only_alerts = st.checkbox("🚨 Show Low-Stock & Excluded Alerts Only", value=False)
+            view_audit = audit_df.copy()
+            if only_alerts and not view_audit.empty:
+                view_audit = view_audit[~view_audit["Stock_Status"].astype(str).str.startswith("OK")]
+            st.dataframe(view_audit, use_container_width=True, height=460, hide_index=True)

@@ -12,6 +12,8 @@ from core.database import (
 )
 from core.secrets import load_all_db_configs
 from modules import (
+    ecomm_research,
+    action_center,
     analytics,
     courier,
     label_printer,
@@ -128,14 +130,90 @@ if not permitted_modules:
     )
     st.stop()
 
-page = st.sidebar.radio("Permitted Modules", permitted_modules)
+
+from core.ui_helpers import inject_global_theme
+
+inject_global_theme()
+
+WORKSPACE_GROUPS = {
+    "🏠 Command & Analytics": [
+        "⚡ Operations Action Center",
+        "📊 Executive & Financial Analytics",
+    ],
+    "🛒 Channels, Pricing & Research": [
+        "🧭 Multi-Channel Wave Research",
+        "🛒 Channel Profitability & Listings",
+        "📥 Supplier Excel Import & Exclusions",
+    ],
+    "📦 Warehouse & Fulfilment": [
+        "🔍 Warehouse Operations (GRN, Picks, Cycle Counts)",
+        "🔫 Barcode Scan In / Out & Bins",
+        "🏷️ Barcode & Shipping Label Printer",
+        "🚚 The Courier Guy (Waybills & Tracking)",
+    ],
+    "⚙️ Finance & Admin": [
+        "💼 Xero Accounting Sync",
+        "🔐 Users, Roles & Granular Permissions",
+        "⚙️ DB Secrets, Credentials & Requirements",
+    ],
+}
+
+# Handle cross-module navigation jumps
+if "nav_override_page" in st.session_state:
+    target_p = st.session_state.pop("nav_override_page")
+    if target_p in permitted_modules:
+        st.session_state["active_module_page"] = target_p
+        for grp_name, grp_items in WORKSPACE_GROUPS.items():
+            if target_p in grp_items:
+                st.session_state["active_workspace_group"] = grp_name
+                break
+
+# Build available workspace groups based on user's permitted modules
+available_groups = {}
+assigned_set = set()
+for grp_name, grp_items in WORKSPACE_GROUPS.items():
+    allowed_in_grp = [m for m in grp_items if m in permitted_modules]
+    if allowed_in_grp:
+        available_groups[grp_name] = allowed_in_grp
+        assigned_set.update(allowed_in_grp)
+
+# Catch any custom/unlisted modules safely
+leftover = [m for m in permitted_modules if m not in assigned_set]
+if leftover:
+    available_groups["📌 Other Modules"] = leftover
+
+group_names = list(available_groups.keys())
+if st.session_state.get("active_workspace_group") not in group_names:
+    st.session_state["active_workspace_group"] = group_names[0]
+
+st.sidebar.markdown("### 🧭 Workspace")
+selected_group = st.sidebar.selectbox(
+    "Department / Workspace",
+    group_names,
+    key="active_workspace_group",
+    label_visibility="collapsed",
+)
+
+group_modules = available_groups[selected_group]
+if st.session_state.get("active_module_page") not in group_modules:
+    st.session_state["active_module_page"] = group_modules[0]
+
+page = st.sidebar.radio(
+    "Module",
+    group_modules,
+    key="active_module_page",
+    label_visibility="collapsed",
+)
+
 
 with st.sidebar.expander("🔑 My Active Permissions"):
     st.write(auth_user["permissions"])
     st.json(auth_user["flags"])
 
 MODULE_ROUTES = {
+    "⚡ Operations Action Center": action_center.render,
     "📊 Executive & Financial Analytics": analytics.render,
+    "🧭 Multi-Channel Wave Research": ecomm_research.render,
     "📥 Supplier Excel Import & Exclusions": supplier_import.render,
     "🔫 Barcode Scan In / Out & Bins": scanner.render,
     "🏷️ Barcode & Shipping Label Printer": label_printer.render,

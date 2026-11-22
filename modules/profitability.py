@@ -1,3 +1,4 @@
+from core.ui_helpers import get_sellerflex_schema
 from datetime import datetime
 import io
 import pandas as pd
@@ -24,15 +25,69 @@ from services.profitability_engine import (
 )
 
 
+def _build_column_config(df: pd.DataFrame) -> dict:
+    """Applies clean currency, percentage, and decision formatting to the profitability matrix."""
+    cfg = {}
+    if "sku" in df.columns:
+        cfg["sku"] = st.column_config.TextColumn("SKU", width="small")
+    if "description" in df.columns:
+        cfg["description"] = st.column_config.TextColumn("Description", width="medium")
+    if "sold_in_min_packs_only" in df.columns:
+        cfg["sold_in_min_packs_only"] = st.column_config.NumberColumn("Min Pack", format="%d", width="small")
+
+    zar_labels = {
+        "single_price_excl_vat": "Unit Cost Excl (R)",
+        "landed_cost_excl_vat": "Landed Excl (R)",
+        "cost_incl_vat": "Landed Incl VAT (R)",
+        "amazon_rec_price": "AMZ Rec (R)",
+        "amazon_actual_price": "AMZ Actual (R)",
+        "amazon_net_profit": "AMZ Profit (R)",
+        "takealot_rec_price": "TAL Rec (R)",
+        "takealot_actual_price": "TAL Actual (R)",
+        "takealot_net_profit": "TAL Profit (R)",
+        "takeazon_rec_price": "TKZ Rec (R)",
+        "takeazon_actual_price": "TKZ Actual (R)",
+        "takeazon_net_profit": "TKZ Profit (R)",
+    }
+    for col, label in zar_labels.items():
+        if col in df.columns:
+            cfg[col] = st.column_config.NumberColumn(label, format="R %.2f")
+
+    pct_labels = {
+        "amazon_discount_pct": "AMZ Disc",
+        "amazon_margin_pct": "AMZ Margin",
+        "amazon_roi_pct": "AMZ ROI",
+        "takealot_discount_pct": "TAL Disc",
+        "takealot_margin_pct": "TAL Margin",
+        "takealot_roi_pct": "TAL ROI",
+        "takeazon_discount_pct": "TKZ Disc",
+        "takeazon_margin_pct": "TKZ Margin",
+        "takeazon_roi_pct": "TKZ ROI",
+    }
+    for col, label in pct_labels.items():
+        if col in df.columns:
+            cfg[col] = st.column_config.NumberColumn(label, format="%.4f")
+
+    for mp_low, prefix in [("amazon", "AMZ"), ("takealot", "TAL"), ("takeazon", "TKZ")]:
+        dec_col = f"{mp_low}_decision"
+        if dec_col in df.columns:
+            cfg[dec_col] = st.column_config.SelectboxColumn(
+                f"{prefix} Decision",
+                options=["LIST", "REVIEW", "DO NOT LIST"],
+                width="small",
+            )
+    return cfg
+
+
 def render(auth_user: dict):
     current_user = auth_user["username"]
     st.title("🛒 Multi-Channel Pricing, Profitability & Listings")
     t1, t2, t3, t4, t5 = st.tabs([
-        "📊 Multi-Marketplace Profitability Matrix",
-        "Amazon Active Listings",
-        "Takealot Listings",
-        "SellerFlex Inventory & Price Sync",
-        "🚀 Amazon Universal Feed Sync (MySQL → SP-API)",
+        "📊 Profitability Matrix",
+        "📦 Amazon Active Listings",
+        "🛍️ Takealot Listings",
+        "🚚 SellerFlex Inventory & Price Sync",
+        "🚀 Amazon Universal Feed Sync",
     ])
 
     # =========================================================================
@@ -41,9 +96,8 @@ def render(auth_user: dict):
     with t1:
         st.subheader("📊 Multi-Marketplace Adaptive-Margin Profitability Calculator")
         st.caption(
-            "Calculates Landed Pack Cost (`single_price_excl_vat × sold_in_min_packs_only` + inbound freight + VAT), "
-            "applies per-channel or global discount overrides, and derives recommended prices, net profits, margins, ROI, "
-            "and listing decisions across **Amazon**, **Takealot**, and **Takeazon**."
+            "Derives Landed Pack Cost (`single_price_excl_vat × sold_in_min_packs_only` + inbound freight + VAT), "
+            "applies channel or global discount overrides, and computes recommended prices, margins, ROI, and listing decisions."
         )
 
         can_edit_prof = has_perm(auth_user, "edit_profitability") or auth_user["flags"].get("can_save_profitability", False)
@@ -56,7 +110,23 @@ def render(auth_user: dict):
         mp_cfg = st.session_state["prof_mp_cfg"]
         g_cfg = st.session_state["prof_global_cfg"]
 
-        with st.expander("⚙️ Marketplace Fee Assumptions, Discounts & Global Landed-Cost Rules", expanded=True):
+        # Concise active rule summary banner above the fold
+        active_disc_msg = (
+            f"🌐 **Global Discount Override: {g_cfg['global_discount_pct'] * 100:.1f}%**"
+            if g_cfg.get("global_discount_pct", 0.0) > 0
+            else (
+                f"🏷️ **Channel Discounts:** Amazon `{mp_cfg['Amazon'].get('discount_pct', 0.0) * 100:.1f}%` · "
+                f"Takealot `{mp_cfg['Takealot'].get('discount_pct', 0.0) * 100:.1f}%` · "
+                f"Takeazon `{mp_cfg['Takeazon'].get('discount_pct', 0.0) * 100:.1f}%`"
+            )
+        )
+        st.info(
+            f"{active_disc_msg}  |  Min Profit: **R{g_cfg['minimum_profit']:.0f}**  |  "
+            f"Min Margin: **{g_cfg['minimum_listing_margin'] * 100:.0f}%**  |  "
+            f"Min ROI: **{g_cfg['minimum_listing_roi'] * 100:.0f}%**"
+        )
+
+        with st.expander("⚙️ Configure Marketplace Fees, Discounts & Global Rules", expanded=False):
             st.markdown("#### 1. Global Discount Override & Channel Discounts")
             gd1, gd2 = st.columns([1.2, 2.8])
             g_cfg["global_discount_pct"] = gd1.number_input(
@@ -164,7 +234,7 @@ def render(auth_user: dict):
         act_b1, act_b2, act_b3, act_b4 = st.columns([1.4, 1.2, 1.3, 1.3])
         preserve_ov = act_b1.checkbox("Keep existing manual `Actual Price` overrides", value=False)
 
-        if act_b2.button("⚡ Recalculate All from `inventory_items`", type="primary", use_container_width=True):
+        if act_b2.button("⚡ Recalculate All SKUs", type="primary", use_container_width=True):
             try:
                 with st.spinner("Computing landed pack costs, discounts & multi-marketplace pricing matrix..."):
                     calc_df = compute_profitability_dataframe(
@@ -201,17 +271,23 @@ def render(auth_user: dict):
                         else 0.0
                     )
                     kpi_cols[idx].metric(
-                        f"{mp} (Disc: {disc_val:.1f}%) — LIST / REVIEW / DNL",
+                        f"{mp} (Disc: {disc_val:.1f}%) · LIST / REVIEW / DNL",
                         f"{list_cnt:,} / {rev_cnt:,} / {dnl_cnt:,}",
                         f"Avg Margin: {avg_m:.1f}%",
                     )
 
             # Filter Controls
             f1, f2 = st.columns([2, 1])
-            search_sku = f1.text_input("Filter by SKU or Description", placeholder="Search SKU or product keyword...")
+            search_sku = f1.text_input("Search SKU or Product Keyword", placeholder="Type SKU or product name...")
             dec_filter = f2.selectbox(
                 "Filter Decision Status",
-                ["ALL", "LIST (Any Channel)", "REVIEW (Any Channel)", "DO NOT LIST (All Channels)"],
+                [
+                    "ALL",
+                    "LIST (All 3 Channels)",
+                    "LIST (Any Channel)",
+                    "REVIEW (Any Channel)",
+                    "DO NOT LIST (All Channels)",
+                ],
             )
 
             view_df = current_prof_df.copy()
@@ -221,7 +297,13 @@ def render(auth_user: dict):
                     view_df["sku"].astype(str).str.lower().str.contains(q_low, na=False)
                     | view_df["description"].astype(str).str.lower().str.contains(q_low, na=False)
                 ]
-            if dec_filter == "LIST (Any Channel)" and "amazon_decision" in view_df.columns:
+            if dec_filter == "LIST (All 3 Channels)" and "amazon_decision" in view_df.columns:
+                view_df = view_df[
+                    (view_df["amazon_decision"] == "LIST")
+                    & (view_df["takealot_decision"] == "LIST")
+                    & (view_df["takeazon_decision"] == "LIST")
+                ]
+            elif dec_filter == "LIST (Any Channel)" and "amazon_decision" in view_df.columns:
                 view_df = view_df[
                     (view_df["amazon_decision"] == "LIST")
                     | (view_df["takealot_decision"] == "LIST")
@@ -240,7 +322,10 @@ def render(auth_user: dict):
                     & (view_df["takeazon_decision"] == "DO NOT LIST")
                 ]
 
-            st.caption(f"Showing **{len(view_df):,}** of **{len(current_prof_df):,}** SKUs (edit `Actual Price`, `Min Pack Qty`, or `Decision` inline below):")
+            st.caption(
+                f"Showing **{len(view_df):,}** of **{len(current_prof_df):,}** SKUs — "
+                "click any `Actual (R)`, `Min Pack`, or `Decision` cell to edit inline:"
+            )
             disabled_cols = [
                 c
                 for c in [
@@ -254,8 +339,10 @@ def render(auth_user: dict):
             edited_view = st.data_editor(
                 view_df,
                 use_container_width=True,
-                height=460,
+                height=480,
+                hide_index=True,
                 disabled=disabled_cols,
+                column_config=_build_column_config(view_df),
                 key="prof_matrix_editor",
             )
 
@@ -269,7 +356,7 @@ def render(auth_user: dict):
                 st.session_state["prof_df"] = current_prof_df
 
             if can_edit_prof:
-                if act_b3.button("💾 Save Matrix to MySQL (`inventory_item_profitability`)", use_container_width=True):
+                if act_b3.button("💾 Save Matrix to MySQL", use_container_width=True):
                     try:
                         with st.spinner("Saving profitability matrix to MySQL..."):
                             save_profitability_to_mysql(current_prof_df, triggered_by=current_user)
@@ -292,25 +379,41 @@ def render(auth_user: dict):
             except Exception as exc:
                 st.error(f"Excel generation error: {exc}")
         else:
-            st.info("`inventory_item_profitability` is currently empty. Click **⚡ Recalculate All from `inventory_items`** above to generate the matrix.")
+            st.info("`inventory_item_profitability` is currently empty. Click **⚡ Recalculate All SKUs** above to generate the matrix.")
 
     # =========================================================================
     # TAB 2: AMAZON ACTIVE LISTINGS
     # =========================================================================
     with t2:
-        st.dataframe(
-            run_query("SELECT sku, asin, item_name, listing_status, current_price, quantity, issues_count FROM amazon_active_listings LIMIT 500"),
-            use_container_width=True,
+        amz_search = st.text_input("Filter Amazon Active Listings", placeholder="Search SKU, ASIN, or item name...", key="amz_tab_search")
+        amz_df = run_query(
+            "SELECT sku, asin, item_name, listing_status, current_price, quantity, issues_count FROM amazon_active_listings LIMIT 1000"
         )
+        if not amz_df.empty and amz_search.strip():
+            q = amz_search.strip().lower()
+            amz_df = amz_df[
+                amz_df["sku"].astype(str).str.lower().str.contains(q, na=False)
+                | amz_df["asin"].astype(str).str.lower().str.contains(q, na=False)
+                | amz_df["item_name"].astype(str).str.lower().str.contains(q, na=False)
+            ]
+        st.dataframe(amz_df, use_container_width=True, hide_index=True)
 
     # =========================================================================
     # TAB 3: TAKEALOT LISTINGS
     # =========================================================================
     with t3:
-        st.dataframe(
-            run_query("SELECT sku, source_asin, barcode, title, selling_price, rrp, stock_quantity, status FROM takealot_listings LIMIT 500"),
-            use_container_width=True,
+        tal_search = st.text_input("Filter Takealot Listings", placeholder="Search SKU, barcode, or title...", key="tal_tab_search")
+        tal_df = run_query(
+            "SELECT sku, source_asin, barcode, title, selling_price, rrp, stock_quantity, status FROM takealot_listings LIMIT 1000"
         )
+        if not tal_df.empty and tal_search.strip():
+            q = tal_search.strip().lower()
+            tal_df = tal_df[
+                tal_df["sku"].astype(str).str.lower().str.contains(q, na=False)
+                | tal_df["barcode"].astype(str).str.lower().str.contains(q, na=False)
+                | tal_df["title"].astype(str).str.lower().str.contains(q, na=False)
+            ]
+        st.dataframe(tal_df, use_container_width=True, hide_index=True)
 
     # =========================================================================
     # TAB 4: SELLER FLEX INVENTORY & PRICE SYNC
@@ -352,7 +455,11 @@ def render(auth_user: dict):
 
         source_mode = st.radio(
             "Select Update Source",
-            ["Upload CSV / Excel (`sku, quantity, price, list_price`)", "Load from Master DB (`inventory_items` + `amazon_active_listings`)"],
+            [
+                "Upload CSV / Excel (`sku, quantity, price, list_price`)",
+                "Load from Master DB (`inventory_items` + `amazon_active_listings`)",
+                "Load Staged Research Candidates (`sellerflex_inventory` PENDING)",
+            ],
             horizontal=True,
         )
 
@@ -379,6 +486,45 @@ def render(auth_user: dict):
                             "price": float(price_val) if pd.notna(price_val) and price_val > 0 else None,
                             "list_price": float(list_val) if pd.notna(list_val) and list_val > 0 else None,
                         })
+        elif source_mode.startswith("Load Staged"):
+            _sf_schema = get_sellerflex_schema()
+            _sf_sku = _sf_schema["sku_col"] or "sku"
+            _sf_qty = f"COALESCE(s.`{_sf_schema['qty_col']}`, 0)" if _sf_schema["qty_col"] else "0"
+            _sf_where = f"WHERE UPPER(COALESCE(s.`{_sf_schema['status_col']}`, '')) = 'PENDING'" if _sf_schema["status_col"] else ""
+            staged_df = run_query(f"""
+                SELECT
+                    s.`{_sf_sku}` AS sku,
+                    {_sf_qty} AS quantity,
+                    COALESCE(NULLIF(p.amazon_actual_price, 0), NULLIF(p.amazon_rec_price, 0), 0) AS price,
+                    NULL AS list_price
+                FROM sellerflex_inventory s
+                LEFT JOIN inventory_item_profitability p ON TRIM(p.sku) = TRIM(s.`{_sf_sku}`)
+                {_sf_where}
+                ORDER BY s.`{_sf_sku}`
+                LIMIT 2000
+            """)
+            if not staged_df.empty:
+                edited_staged = st.data_editor(
+                    staged_df,
+                    use_container_width=True,
+                    num_rows="dynamic",
+                    hide_index=True,
+                    key="sf_staged_editor",
+                )
+                for _, r in edited_staged.iterrows():
+                    sku_val = str(r["sku"]).strip()
+                    if not sku_val:
+                        continue
+                    price_val = pd.to_numeric(r.get("price"), errors="coerce")
+                    list_val = pd.to_numeric(r.get("list_price"), errors="coerce")
+                    items_to_sync.append({
+                        "sku": sku_val,
+                        "quantity": max(0, int(pd.to_numeric(r["quantity"], errors="coerce") or 0)),
+                        "price": float(price_val) if pd.notna(price_val) and price_val > 0 else None,
+                        "list_price": float(list_val) if pd.notna(list_val) and list_val > 0 else None,
+                    })
+            else:
+                st.info("No `PENDING` rows found in `sellerflex_inventory`. Stage candidates from **Multi-Channel Wave Research** first.")
         else:
             db_df = run_query("""
                 SELECT
@@ -397,6 +543,7 @@ def render(auth_user: dict):
                     db_df,
                     use_container_width=True,
                     num_rows="dynamic",
+                    hide_index=True,
                     key="sf_db_editor",
                 )
                 for _, r in edited_df.iterrows():
@@ -415,7 +562,7 @@ def render(auth_user: dict):
         if items_to_sync:
             st.info(f"Ready to sync **{len(items_to_sync):,}** SKU(s) to Amazon Seller Flex.")
             if source_mode.startswith("Upload"):
-                st.dataframe(pd.DataFrame(items_to_sync).head(100), use_container_width=True)
+                st.dataframe(pd.DataFrame(items_to_sync).head(100), use_container_width=True, hide_index=True)
 
             act1, act2, act3 = st.columns(3)
             sync_inv_flag = act1.checkbox("📦 Push Seller Flex Inventory (`batch_inventory`)", value=True)
@@ -434,7 +581,7 @@ def render(auth_user: dict):
                                 triggered_by=current_user,
                             )
                         st.success(f"Inventory batch push complete ({len(inv_res)} SKUs processed).")
-                        st.dataframe(pd.DataFrame(inv_res), use_container_width=True)
+                        st.dataframe(pd.DataFrame(inv_res), use_container_width=True, hide_index=True)
 
                     if sync_price_flag:
                         price_items = [x for x in items_to_sync if x.get("price") is not None]
@@ -450,13 +597,13 @@ def render(auth_user: dict):
                                     triggered_by=current_user,
                                 )
                             st.success(f"Listing price patch complete ({len(price_res)} SKUs processed).")
-                            st.dataframe(pd.DataFrame(price_res), use_container_width=True)
+                            st.dataframe(pd.DataFrame(price_res), use_container_width=True, hide_index=True)
                 except Exception as exc:
                     st.error(f"Seller Flex Sync Error: {exc}")
 
         st.divider()
         st.markdown("#### Current `sellerflex_inventory` Snapshot")
-        st.dataframe(run_query("SELECT * FROM sellerflex_inventory LIMIT 500"), use_container_width=True)
+        st.dataframe(run_query("SELECT * FROM sellerflex_inventory LIMIT 500"), use_container_width=True, hide_index=True)
 
     # =========================================================================
     # TAB 5: AMAZON UNIVERSAL FEED SYNC (MYSQL -> SP-API)
@@ -581,7 +728,7 @@ def render(auth_user: dict):
             m2.metric("SKUs with Pending Changes", f"{len(to_upd):,}")
             m3.metric("SKUs Unchanged", f"{tot_ex - len(to_upd):,}")
 
-            st.dataframe(rep_df, use_container_width=True)
+            st.dataframe(rep_df, use_container_width=True, hide_index=True)
 
             xlsx_buf = io.BytesIO()
             with pd.ExcelWriter(xlsx_buf, engine="openpyxl") as writer:
