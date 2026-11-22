@@ -1,0 +1,153 @@
+import importlib
+import io
+import os
+import subprocess
+import sys
+
+import pandas as pd
+import streamlit as st
+from sqlalchemy import bindparam, create_engine, text
+
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = os.getenv("DB_PORT", "3306")
+DB_NAME = os.getenv("DB_NAME", "takeazon_db")
+DB_USER = os.getenv("DB_USER", "root")
+DB_PASS = os.getenv("DB_PASSWORD", "Password12")
+
+
+@st.cache_resource
+def get_engine():
+    url = f"mysql+pymysql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}?charset=utf8mb4"
+    return create_engine(url, pool_pre_ping=True, pool_recycle=3600, pool_size=10, max_overflow=20)
+
+
+engine = get_engine()
+
+
+def run_query(sql: str, params: dict = None, expanding_keys: list = None) -> pd.DataFrame:
+    stmt = text(sql)
+    if expanding_keys:
+        for ek in expanding_keys:
+            stmt = stmt.bindparams(bindparam(ek, expanding=True))
+    with engine.connect() as conn:
+        return pd.read_sql(stmt, conn, params=params or {})
+
+
+def execute_sql(sql: str, params=None):
+    with engine.begin() as conn:
+        conn.execute(text(sql), params or {})
+
+
+def log_audit(username: str, event_type: str, title: str, details: str, sku_count: int = 0):
+    execute_sql(
+        """
+        INSERT INTO app_audit_logs (username, event_type, event_title, details, sku_count)
+        VALUES (:u, :et, :title, :det, :cnt)
+        """,
+        {"u": username, "et": event_type, "title": title, "det": details, "cnt": sku_count},
+    )
+
+
+@st.cache_resource
+def bootstrap_app_startup():
+    try:
+        df = run_query("SELECT setting_value FROM system_settings WHERE setting_key = 'app_requirements' LIMIT 1")
+        if not df.empty and df.iloc[0]["setting_value"]:
+            raw_reqs = str(df.iloc[0]["setting_value"])
+            packages = [
+                line.strip()
+                for line in raw_reqs.replace(",", "\n").splitlines()
+                if line.strip() and not line.strip().startswith("#")
+            ]
+            pkg_import_map = {"pillow": "PIL", "pymysql": "pymysql", "bcrypt": "bcrypt"}
+            for pkg in packages:
+                base_name = pkg.split("==")[0].split(">=")[0].split("<=")[0].strip().lower()
+                if base_name in ("python-barcode", "setuptools"):
+                    continue
+                mod_name = pkg_import_map.get(base_name, base_name.replace("-", "_"))
+                try:
+                    importlib.import_module(mod_name)
+                except ImportError:
+                    try:
+                        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    baseline = [
+        ("view_analytics", "analytics", "View Executive & Financial Analytics"),
+        ("sync_amazon_finances", "analytics", "Pull Financial Data from Amazon.co.za SP-API"),
+        ("upload_supplier_excel", "suppliers", "Upload Supplier Excel & Run Exclusions"),
+        ("upsert_supplier_items", "suppliers", "Commit/Upsert Supplier Stock & Cost to Master Inventory"),
+        ("scan_inventory", "wms", "Scan Products In and Out of Warehouse Bins"),
+        ("print_labels", "wms", "Generate & Print Barcode and Bin Labels"),
+        ("manage_courier", "courier", "Create & Track The Courier Guy Waybills"),
+        ("sync_xero", "accounting", "Refresh Xero Tokens & Pull/Push Financial Data"),
+        ("view_profitability", "channels", "View Channel Profitability & Marketplace Listings"),
+        ("view_ecomm_research", "channels", "Access Multi-Channel Wave Research & 10-Wave Planner"),
+        ("edit_profitability", "channels", "Modify & Save Profitability Pricing Decisions"),
+        ("warehouse_ops", "wms", "Create GRNs, Pick Lists, and Approve Cycle Counts"),
+        ("manage_secrets", "admin", "View & Update API Secrets and System Requirements"),
+        ("manage_users", "admin", "Create Users, Assign Roles & Edit Granular Permissions"),
+    ]
+    try:
+        with engine.begin() as conn:
+            conn.execute(
+                text("""
+                    INSERT IGNORE INTO system_permissions (permission_key, module, description)
+                    VALUES (:k, :m, :d)
+                """),
+                [{"k": k, "m": m, "d": d} for k, m, d in baseline],
+            )
+    except Exception:
+        pass
+
+    for col_name in ("barcode", "inner_barcode", "case_barcode"):
+        try:
+            if run_query(f"SHOW COLUMNS FROM inventory_items LIKE '{col_name}'").empty:
+                execute_sql(f"ALTER TABLE inventory_items ADD COLUMN {col_name} VARCHAR(64) NULL")
+                execute_sql(f"CREATE INDEX idx_inventory_items_{col_name} ON inventory_items ({col_name})")
+        except Exception:
+            pass
+
+    try:
+        execute_sql("""
+            CREATE TABLE IF NOT EXISTS sellerflex_inventory (
+                sku VARCHAR(100) PRIMARY KEY,
+                location_id VARCHAR(32) NULL,
+                quantity INT NOT NULL DEFAULT 0,
+                last_synced_at DATETIME NULL
+            )
+        """)
+    except Exception:
+        pass
+    return True
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def get_cached_active_bins() -> list:
+    df = run_query("SELECT bin_code FROM warehouse_bins WHERE is_active = 1 ORDER BY bin_code")
+    return df["bin_code"].tolist() if not df.empty else ["MAIN-A1-01"]
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def get_cached_master_skus() -> pd.DataFrame:
+    return run_query(
+        "SELECT sku, COALESCE(title, '') AS title, COALESCE(single_price_excl_vat, 0) AS single_price_excl_vat FROM inventory_items ORDER BY sku LIMIT 10000"
+    )
+
+
+@st.cache_data(show_spinner=False)
+def get_excel_sheet_names(file_bytes: bytes) -> list:
+    return pd.ExcelFile(io.BytesIO(file_bytes)).sheet_names
+
+
+@st.cache_data(show_spinner=False)
+def load_uploaded_spreadsheet(file_bytes: bytes, file_name: str, sheet_name: str = "") -> pd.DataFrame:
+    buf = io.BytesIO(file_bytes)
+    if file_name.lower().endswith(".csv"):
+        return pd.read_csv(buf)
+    xl = pd.ExcelFile(buf)
+    target = sheet_name if sheet_name in xl.sheet_names else xl.sheet_names[0]
+    return xl.parse(target)

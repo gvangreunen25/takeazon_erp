@@ -1,0 +1,628 @@
+from datetime import datetime
+import io
+import pandas as pd
+import streamlit as st
+
+from core.auth import has_perm
+from core.database import execute_sql, load_uploaded_spreadsheet, run_query
+from core.secrets import get_db_secret, load_all_db_configs
+from services.amazon_sp import (
+    audit_mysql_vs_live_amazon,
+    build_universal_listings_feed,
+    fetch_products_for_amazon_feed,
+    submit_bulk_json_listings_feed,
+    update_amazon_listing_prices_batch,
+    update_sellerflex_inventory_batch,
+)
+from services.profitability_engine import (
+    MARKETPLACES,
+    build_profitability_excel_bytes,
+    compute_profitability_dataframe,
+    get_default_configs,
+    recalculate_edited_matrix,
+    save_profitability_to_mysql,
+)
+
+
+def render(auth_user: dict):
+    current_user = auth_user["username"]
+    st.title("🛒 Multi-Channel Pricing, Profitability & Listings")
+    t1, t2, t3, t4, t5 = st.tabs([
+        "📊 Multi-Marketplace Profitability Matrix",
+        "Amazon Active Listings",
+        "Takealot Listings",
+        "SellerFlex Inventory & Price Sync",
+        "🚀 Amazon Universal Feed Sync (MySQL → SP-API)",
+    ])
+
+    # =========================================================================
+    # TAB 1: ADAPTIVE-MARGIN PROFITABILITY CALCULATOR & MATRIX
+    # =========================================================================
+    with t1:
+        st.subheader("📊 Multi-Marketplace Adaptive-Margin Profitability Calculator")
+        st.caption(
+            "Calculates Landed Pack Cost (`single_price_excl_vat × sold_in_min_packs_only` + inbound freight + VAT), "
+            "applies per-channel or global discount overrides, and derives recommended prices, net profits, margins, ROI, "
+            "and listing decisions across **Amazon**, **Takealot**, and **Takeazon**."
+        )
+
+        can_edit_prof = has_perm(auth_user, "edit_profitability") or auth_user["flags"].get("can_save_profitability", False)
+
+        if "prof_mp_cfg" not in st.session_state or "prof_global_cfg" not in st.session_state:
+            mp_def, g_def = get_default_configs()
+            st.session_state["prof_mp_cfg"] = mp_def
+            st.session_state["prof_global_cfg"] = g_def
+
+        mp_cfg = st.session_state["prof_mp_cfg"]
+        g_cfg = st.session_state["prof_global_cfg"]
+
+        with st.expander("⚙️ Marketplace Fee Assumptions, Discounts & Global Landed-Cost Rules", expanded=True):
+            st.markdown("#### 1. Global Discount Override & Channel Discounts")
+            gd1, gd2 = st.columns([1.2, 2.8])
+            g_cfg["global_discount_pct"] = gd1.number_input(
+                "🌐 Global Discount Override (%)",
+                min_value=0.0,
+                max_value=95.0,
+                value=round(float(g_cfg.get("global_discount_pct", 0.0)) * 100, 2),
+                step=1.0,
+                help="If set greater than 0%, this percentage overwrites all individual Amazon, Takealot, and Takeazon discounts.",
+                key="cfg_global_discount",
+            ) / 100.0
+
+            if g_cfg["global_discount_pct"] > 0:
+                gd2.warning(
+                    f"**Global Discount Override Active ({g_cfg['global_discount_pct'] * 100:.1f}%):** "
+                    "Overwriting individual Amazon, Takealot, and Takeazon discount percentages."
+                )
+            else:
+                gd2.info("Global Discount Override is **0.0%** — individual channel discount percentages below apply.")
+
+            st.markdown("#### 2. Marketplace Fee Assumptions & Individual Channel Discounts")
+            mp_cols = st.columns(3)
+            for idx, mp in enumerate(MARKETPLACES):
+                with mp_cols[idx]:
+                    st.markdown(f"**{mp}**")
+                    mp_cfg[mp]["discount_pct"] = st.number_input(
+                        f"{mp} Discount (%)",
+                        min_value=0.0,
+                        max_value=95.0,
+                        value=round(float(mp_cfg[mp].get("discount_pct", 0.0)) * 100, 2),
+                        step=1.0,
+                        disabled=(g_cfg["global_discount_pct"] > 0),
+                        key=f"cfg_{mp}_disc",
+                    ) / 100.0
+                    mp_cfg[mp]["referral_fee"] = st.number_input(
+                        f"{mp} Referral Fee (%)",
+                        min_value=0.0,
+                        max_value=100.0,
+                        value=round(mp_cfg[mp]["referral_fee"] * 100, 2),
+                        step=0.5,
+                        key=f"cfg_{mp}_ref",
+                    ) / 100.0
+                    mp_cfg[mp]["fulfilment_fee"] = st.number_input(
+                        f"{mp} Fulfilment Fee (R)",
+                        min_value=0.0,
+                        value=float(mp_cfg[mp]["fulfilment_fee"]),
+                        step=1.0,
+                        key=f"cfg_{mp}_ful",
+                    )
+                    mp_cfg[mp]["subscription_allocation"] = st.number_input(
+                        f"{mp} Subscription Alloc (R)",
+                        min_value=0.0,
+                        value=float(mp_cfg[mp]["subscription_allocation"]),
+                        step=1.0,
+                        key=f"cfg_{mp}_sub",
+                    )
+                    mp_cfg[mp]["return_fee"] = st.number_input(
+                        f"{mp} Return Fee (R)",
+                        min_value=0.0,
+                        value=float(mp_cfg[mp]["return_fee"]),
+                        step=1.0,
+                        key=f"cfg_{mp}_ret",
+                    )
+                    mp_cfg[mp]["packaging_admin"] = st.number_input(
+                        f"{mp} Packaging / Admin (R)",
+                        min_value=0.0,
+                        value=float(mp_cfg[mp]["packaging_admin"]),
+                        step=1.0,
+                        key=f"cfg_{mp}_pkg",
+                    )
+                    mp_cfg[mp]["total_integration_fee"] = st.number_input(
+                        f"{mp} Total Integration Fee (R)",
+                        min_value=0.0,
+                        value=float(mp_cfg[mp]["total_integration_fee"]),
+                        step=50.0,
+                        key=f"cfg_{mp}_int",
+                    )
+                    mp_cfg[mp]["other_cost"] = st.number_input(
+                        f"{mp} Other Direct Cost (R)",
+                        min_value=0.0,
+                        value=float(mp_cfg[mp]["other_cost"]),
+                        step=1.0,
+                        key=f"cfg_{mp}_oth",
+                    )
+
+            st.divider()
+            st.markdown("#### 3. Global Rules, Inbound Freight & Pricing Thresholds")
+            gr1, gr2, gr3, gr4 = st.columns(4)
+            g_cfg["vat_rate"] = gr1.number_input("VAT Rate (%)", 0.0, 50.0, round(g_cfg["vat_rate"] * 100, 2), 0.5) / 100.0
+            g_cfg["inbound_freight_pct"] = gr2.number_input("Inbound Freight / Fuel (%)", 0.0, 100.0, round(g_cfg["inbound_freight_pct"] * 100, 2), 0.5) / 100.0
+            g_cfg["inbound_freight_flat"] = gr3.number_input("Inbound Freight Flat (R/pack)", 0.0, 500.0, float(g_cfg["inbound_freight_flat"]), 1.0)
+            g_cfg["minimum_profit"] = gr4.number_input("Min Profit per Pack (R)", 0.0, 1000.0, float(g_cfg["minimum_profit"]), 5.0)
+
+            gr5, gr6, gr7, gr8 = st.columns(4)
+            g_cfg["rounding_increment"] = gr5.number_input("Price Rounding Increment (R)", 0.5, 100.0, float(g_cfg["rounding_increment"]), 1.0)
+            g_cfg["price_ending_deduction"] = gr6.number_input("Price Ending Deduction (R)", 0.0, 1.0, float(g_cfg["price_ending_deduction"]), 0.01)
+            g_cfg["minimum_listing_margin"] = gr7.number_input("Min Listing Margin (%)", 0.0, 100.0, round(g_cfg["minimum_listing_margin"] * 100, 2), 1.0) / 100.0
+            g_cfg["minimum_listing_roi"] = gr8.number_input("Min Listing ROI (%)", 0.0, 500.0, round(g_cfg["minimum_listing_roi"] * 100, 2), 1.0) / 100.0
+
+        # Load current DB table if not yet in session state
+        if "prof_df" not in st.session_state:
+            existing_db_df = run_query("SELECT * FROM inventory_item_profitability ORDER BY sku")
+            st.session_state["prof_df"] = existing_db_df
+
+        act_b1, act_b2, act_b3, act_b4 = st.columns([1.4, 1.2, 1.3, 1.3])
+        preserve_ov = act_b1.checkbox("Keep existing manual `Actual Price` overrides", value=False)
+
+        if act_b2.button("⚡ Recalculate All from `inventory_items`", type="primary", use_container_width=True):
+            try:
+                with st.spinner("Computing landed pack costs, discounts & multi-marketplace pricing matrix..."):
+                    calc_df = compute_profitability_dataframe(
+                        mp_configs=mp_cfg,
+                        global_configs=g_cfg,
+                        preserve_existing_overrides=preserve_ov,
+                    )
+                if calc_df.empty:
+                    st.warning("No valid items with `single_price_excl_vat > 0` found in `inventory_items`.")
+                else:
+                    st.session_state["prof_df"] = calc_df
+                    st.success(f"Calculated profitability matrix for **{len(calc_df):,}** SKUs.")
+            except Exception as exc:
+                st.error(f"Calculation error: {exc}")
+
+        current_prof_df: pd.DataFrame = st.session_state.get("prof_df", pd.DataFrame())
+
+        if not current_prof_df.empty:
+            # Summary Dashboard KPIs across Amazon, Takealot, Takeazon
+            kpi_cols = st.columns(3)
+            for idx, mp in enumerate(MARKETPLACES):
+                p_low = mp.lower()
+                dec_col = f"{p_low}_decision"
+                m_col = f"{p_low}_margin_pct"
+                d_col = f"{p_low}_discount_pct"
+                if dec_col in current_prof_df.columns:
+                    list_cnt = int((current_prof_df[dec_col] == "LIST").sum())
+                    rev_cnt = int((current_prof_df[dec_col] == "REVIEW").sum())
+                    dnl_cnt = int((current_prof_df[dec_col] == "DO NOT LIST").sum())
+                    avg_m = float(pd.to_numeric(current_prof_df[m_col], errors="coerce").mean() or 0.0) * 100
+                    disc_val = (
+                        float(pd.to_numeric(current_prof_df[d_col], errors="coerce").iloc[0] or 0.0) * 100
+                        if d_col in current_prof_df.columns
+                        else 0.0
+                    )
+                    kpi_cols[idx].metric(
+                        f"{mp} (Disc: {disc_val:.1f}%) — LIST / REVIEW / DNL",
+                        f"{list_cnt:,} / {rev_cnt:,} / {dnl_cnt:,}",
+                        f"Avg Margin: {avg_m:.1f}%",
+                    )
+
+            # Filter Controls
+            f1, f2 = st.columns([2, 1])
+            search_sku = f1.text_input("Filter by SKU or Description", placeholder="Search SKU or product keyword...")
+            dec_filter = f2.selectbox(
+                "Filter Decision Status",
+                ["ALL", "LIST (Any Channel)", "REVIEW (Any Channel)", "DO NOT LIST (All Channels)"],
+            )
+
+            view_df = current_prof_df.copy()
+            if search_sku.strip():
+                q_low = search_sku.strip().lower()
+                view_df = view_df[
+                    view_df["sku"].astype(str).str.lower().str.contains(q_low, na=False)
+                    | view_df["description"].astype(str).str.lower().str.contains(q_low, na=False)
+                ]
+            if dec_filter == "LIST (Any Channel)" and "amazon_decision" in view_df.columns:
+                view_df = view_df[
+                    (view_df["amazon_decision"] == "LIST")
+                    | (view_df["takealot_decision"] == "LIST")
+                    | (view_df["takeazon_decision"] == "LIST")
+                ]
+            elif dec_filter == "REVIEW (Any Channel)" and "amazon_decision" in view_df.columns:
+                view_df = view_df[
+                    (view_df["amazon_decision"] == "REVIEW")
+                    | (view_df["takealot_decision"] == "REVIEW")
+                    | (view_df["takeazon_decision"] == "REVIEW")
+                ]
+            elif dec_filter == "DO NOT LIST (All Channels)" and "amazon_decision" in view_df.columns:
+                view_df = view_df[
+                    (view_df["amazon_decision"] == "DO NOT LIST")
+                    & (view_df["takealot_decision"] == "DO NOT LIST")
+                    & (view_df["takeazon_decision"] == "DO NOT LIST")
+                ]
+
+            st.caption(f"Showing **{len(view_df):,}** of **{len(current_prof_df):,}** SKUs (edit `Actual Price`, `Min Pack Qty`, or `Decision` inline below):")
+            disabled_cols = [
+                c
+                for c in [
+                    "sku", "description", "single_price_excl_vat", "landed_cost_excl_vat", "cost_incl_vat",
+                    "amazon_discount_pct", "amazon_rec_price", "amazon_net_profit", "amazon_margin_pct", "amazon_roi_pct",
+                    "takealot_discount_pct", "takealot_rec_price", "takealot_net_profit", "takealot_margin_pct", "takealot_roi_pct",
+                    "takeazon_discount_pct", "takeazon_rec_price", "takeazon_net_profit", "takeazon_margin_pct", "takeazon_roi_pct",
+                ]
+                if c in view_df.columns
+            ]
+            edited_view = st.data_editor(
+                view_df,
+                use_container_width=True,
+                height=460,
+                disabled=disabled_cols,
+                key="prof_matrix_editor",
+            )
+
+            # Merge any inline edits back into full DataFrame and recalculate metrics
+            if not edited_view.equals(view_df):
+                recalc_sub = recalculate_edited_matrix(edited_view, mp_cfg, g_cfg)
+                full_idx = current_prof_df.set_index("sku")
+                sub_idx = recalc_sub.set_index("sku")
+                full_idx.update(sub_idx)
+                current_prof_df = full_idx.reset_index()
+                st.session_state["prof_df"] = current_prof_df
+
+            if can_edit_prof:
+                if act_b3.button("💾 Save Matrix to MySQL (`inventory_item_profitability`)", use_container_width=True):
+                    try:
+                        with st.spinner("Saving profitability matrix to MySQL..."):
+                            save_profitability_to_mysql(current_prof_df, triggered_by=current_user)
+                        st.success(f"Saved **{len(current_prof_df):,}** rows to `inventory_item_profitability`.")
+                    except Exception as exc:
+                        st.error(f"Database save failed: {exc}")
+            else:
+                act_b3.info("Need `edit_profitability` permission to save.")
+
+            try:
+                excel_bytes = build_profitability_excel_bytes(current_prof_df, mp_cfg, g_cfg)
+                today_str = datetime.now().strftime("%d-%m-%Y")
+                act_b4.download_button(
+                    "⬇️ Download Formula Excel (.xlsx)",
+                    data=excel_bytes,
+                    file_name=f"Ecommerce_MultiMarketplace_Profitability_Calculator_{today_str}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
+            except Exception as exc:
+                st.error(f"Excel generation error: {exc}")
+        else:
+            st.info("`inventory_item_profitability` is currently empty. Click **⚡ Recalculate All from `inventory_items`** above to generate the matrix.")
+
+    # =========================================================================
+    # TAB 2: AMAZON ACTIVE LISTINGS
+    # =========================================================================
+    with t2:
+        st.dataframe(
+            run_query("SELECT sku, asin, item_name, listing_status, current_price, quantity, issues_count FROM amazon_active_listings LIMIT 500"),
+            use_container_width=True,
+        )
+
+    # =========================================================================
+    # TAB 3: TAKEALOT LISTINGS
+    # =========================================================================
+    with t3:
+        st.dataframe(
+            run_query("SELECT sku, source_asin, barcode, title, selling_price, rrp, stock_quantity, status FROM takealot_listings LIMIT 500"),
+            use_container_width=True,
+        )
+
+    # =========================================================================
+    # TAB 4: SELLER FLEX INVENTORY & PRICE SYNC
+    # =========================================================================
+    with t4:
+        st.subheader("🚚 Amazon Seller Flex Inventory & Listings Price Sync")
+        st.caption(
+            "Batch-updates Seller Flex node stock (`POST /externalFulfillment/inventory/2024-09-11/inventory/batch`, 20 SKUs/call) "
+            "and patches `purchasable_offer` / `list_price` via Listings Items API."
+        )
+
+        can_sync = has_perm(auth_user, "sync_amazon_finances") or auth_user["flags"].get("can_live_sync", False)
+
+        saved_seller_id = get_db_secret("AMAZON_SELLER_ID", fallback_keys=["AMAZON_MERCHANT_ID"], default="")
+        saved_loc_id = get_db_secret("AMAZON_SELLERFLEX_LOCATION_ID", default="")
+        saved_mkt_id = get_db_secret("AMAZON_MARKETPLACE_ID", default="AE08WJ6YNG13I")
+        saved_curr = get_db_secret("AMAZON_CURRENCY", default="ZAR")
+
+        with st.expander("⚙️ Seller Flex Node & Marketplace Configuration", expanded=not (saved_seller_id and saved_loc_id)):
+            c1, c2, c3, c4 = st.columns(4)
+            seller_id = c1.text_input("Amazon Seller / Merchant ID *", value=saved_seller_id, placeholder="e.g., ADFGNDF7TFRLF", key="sf_seller_id")
+            location_id = c2.text_input("Seller Flex Location / Node ID *", value=saved_loc_id, placeholder="4-char Node ID, e.g., ABCD", key="sf_loc_id")
+            marketplace_id = c3.text_input("Marketplace ID", value=saved_mkt_id, help="AE08WJ6YNG13I = Amazon.co.za", key="sf_mkt_id")
+            currency = c4.text_input("Currency", value=saved_curr, key="sf_curr")
+
+            if st.button("💾 Save Seller Flex Config to `system_settings`"):
+                for k, v in [
+                    ("AMAZON_SELLER_ID", seller_id.strip()),
+                    ("AMAZON_SELLERFLEX_LOCATION_ID", location_id.strip()),
+                    ("AMAZON_MARKETPLACE_ID", marketplace_id.strip()),
+                    ("AMAZON_CURRENCY", currency.strip()),
+                ]:
+                    execute_sql(
+                        "INSERT INTO system_settings (setting_key, setting_value) VALUES (:k, :v) ON DUPLICATE KEY UPDATE setting_value = :v",
+                        {"k": k, "v": v},
+                    )
+                load_all_db_configs.clear()
+                st.success("Saved Seller Flex settings to `system_settings`.")
+
+        source_mode = st.radio(
+            "Select Update Source",
+            ["Upload CSV / Excel (`sku, quantity, price, list_price`)", "Load from Master DB (`inventory_items` + `amazon_active_listings`)"],
+            horizontal=True,
+        )
+
+        items_to_sync = []
+
+        if source_mode.startswith("Upload"):
+            sf_file = st.file_uploader("Upload Seller Flex Updates (.csv or .xlsx)", type=["csv", "xlsx"], key="sf_upload")
+            if sf_file is not None:
+                df_raw = load_uploaded_spreadsheet(sf_file.getvalue(), sf_file.name)
+                df_raw.columns = [c.strip().lower() for c in df_raw.columns]
+                if "sku" not in df_raw.columns or "quantity" not in df_raw.columns:
+                    st.error("File must contain at least `sku` and `quantity` columns (optional: `price`, `list_price`).")
+                else:
+                    for _, r in df_raw.iterrows():
+                        sku_val = str(r["sku"]).strip()
+                        if not sku_val or sku_val.lower() in ("nan", "none"):
+                            continue
+                        qty_val = int(pd.to_numeric(r["quantity"], errors="coerce") or 0)
+                        price_val = pd.to_numeric(r.get("price"), errors="coerce")
+                        list_val = pd.to_numeric(r.get("list_price"), errors="coerce")
+                        items_to_sync.append({
+                            "sku": sku_val,
+                            "quantity": max(0, qty_val),
+                            "price": float(price_val) if pd.notna(price_val) and price_val > 0 else None,
+                            "list_price": float(list_val) if pd.notna(list_val) and list_val > 0 else None,
+                        })
+        else:
+            db_df = run_query("""
+                SELECT
+                    a.sku,
+                    COALESCE(i.quantity, 0) AS quantity,
+                    COALESCE(NULLIF(p.amazon_actual_price, 0), NULLIF(p.amazon_rec_price, 0), a.current_price, 0) AS price,
+                    NULL AS list_price
+                FROM amazon_active_listings a
+                INNER JOIN inventory_items i ON i.sku = a.sku
+                LEFT JOIN inventory_item_profitability p ON p.sku = a.sku
+                ORDER BY a.sku
+                LIMIT 2000
+            """)
+            if not db_df.empty:
+                edited_df = st.data_editor(
+                    db_df,
+                    use_container_width=True,
+                    num_rows="dynamic",
+                    key="sf_db_editor",
+                )
+                for _, r in edited_df.iterrows():
+                    sku_val = str(r["sku"]).strip()
+                    if not sku_val:
+                        continue
+                    price_val = pd.to_numeric(r.get("price"), errors="coerce")
+                    list_val = pd.to_numeric(r.get("list_price"), errors="coerce")
+                    items_to_sync.append({
+                        "sku": sku_val,
+                        "quantity": max(0, int(pd.to_numeric(r["quantity"], errors="coerce") or 0)),
+                        "price": float(price_val) if pd.notna(price_val) and price_val > 0 else None,
+                        "list_price": float(list_val) if pd.notna(list_val) and list_val > 0 else None,
+                    })
+
+        if items_to_sync:
+            st.info(f"Ready to sync **{len(items_to_sync):,}** SKU(s) to Amazon Seller Flex.")
+            if source_mode.startswith("Upload"):
+                st.dataframe(pd.DataFrame(items_to_sync).head(100), use_container_width=True)
+
+            act1, act2, act3 = st.columns(3)
+            sync_inv_flag = act1.checkbox("📦 Push Seller Flex Inventory (`batch_inventory`)", value=True)
+            sync_price_flag = act2.checkbox("🏷️ Patch Listing Prices (`purchasable_offer` / `list_price`)", value=True)
+
+            if not can_sync:
+                st.warning("You need `sync_amazon_finances` or `can_live_sync` permission to push updates to Amazon SP-API.")
+            elif act3.button("🚀 Run Seller Flex Sync Now", type="primary", use_container_width=True):
+                try:
+                    if sync_inv_flag:
+                        with st.spinner(f"Pushing Seller Flex inventory in batches of 20 to node `{location_id}`..."):
+                            inv_res = update_sellerflex_inventory_batch(
+                                location_id=location_id,
+                                items=items_to_sync,
+                                batch_size=20,
+                                triggered_by=current_user,
+                            )
+                        st.success(f"Inventory batch push complete ({len(inv_res)} SKUs processed).")
+                        st.dataframe(pd.DataFrame(inv_res), use_container_width=True)
+
+                    if sync_price_flag:
+                        price_items = [x for x in items_to_sync if x.get("price") is not None]
+                        if not price_items:
+                            st.warning("No valid `price` > 0 values found to patch.")
+                        else:
+                            with st.spinner(f"Patching listing prices for {len(price_items)} SKU(s)..."):
+                                price_res = update_amazon_listing_prices_batch(
+                                    seller_id=seller_id,
+                                    marketplace_id=marketplace_id,
+                                    currency=currency,
+                                    items=price_items,
+                                    triggered_by=current_user,
+                                )
+                            st.success(f"Listing price patch complete ({len(price_res)} SKUs processed).")
+                            st.dataframe(pd.DataFrame(price_res), use_container_width=True)
+                except Exception as exc:
+                    st.error(f"Seller Flex Sync Error: {exc}")
+
+        st.divider()
+        st.markdown("#### Current `sellerflex_inventory` Snapshot")
+        st.dataframe(run_query("SELECT * FROM sellerflex_inventory LIMIT 500"), use_container_width=True)
+
+    # =========================================================================
+    # TAB 5: AMAZON UNIVERSAL FEED SYNC (MYSQL -> SP-API)
+    # =========================================================================
+    with t5:
+        st.subheader("🚀 Amazon SP-API Universal Listing Sync Engine (MySQL → Bulk JSON Feed)")
+        st.caption(
+            "Audits MySQL (`inventory_item_profitability`, `inventory_items`, `amazon_active_listings`) against live Amazon.co.za listings, "
+            "generates a downloadable Excel delta report, and submits bulk `JSON_LISTINGS_FEED` (`PARTIAL_UPDATE`) batches up to 1,000 SKUs/feed."
+        )
+
+        can_sync_feed = has_perm(auth_user, "sync_amazon_finances") or auth_user["flags"].get("can_live_sync", False)
+        u_seller_id = get_db_secret("AMAZON_SELLER_ID", fallback_keys=["AMAZON_MERCHANT_ID"], default="")
+        u_mkt_id = get_db_secret("AMAZON_MARKETPLACE_ID", default="AE08WJ6YNG13I")
+
+        cfg1, cfg2, cfg3 = st.columns([1.2, 1.2, 1.6])
+        feed_seller_id = cfg1.text_input("Seller / Merchant ID *", value=u_seller_id, placeholder="e.g., ADFGNDF7TFRLF", key="uf_seller_id")
+        feed_mkt_id = cfg2.text_input("Marketplace ID", value=u_mkt_id, key="uf_mkt_id")
+        attr_scope_label = cfg3.selectbox(
+            "Attribute Scope to Update",
+            [
+                "both — Both Price & Quantity",
+                "price — Price Only (purchasable_offer)",
+                "quantity — Quantity Only (fulfillment_availability)",
+                "title — Product Title / Item Name",
+                "bullets — Bullet Points",
+                "description — Product Description",
+                "dimensions — Item & Package Dimensions",
+                "weight — Package Weight",
+                "all — ALL Stored Attributes",
+            ],
+            index=0,
+        )
+        update_type = attr_scope_label.split(" — ")[0].strip()
+
+        r1, r2, r3, r4 = st.columns(4)
+        stock_src = r1.selectbox("MySQL Stock Column", ["stock_ct", "quantity", "stock_jhb", "stock_dbn"], index=0)
+        min_cutoff = r2.number_input("Zero-Out Stock If ≤", min_value=0, value=75, step=5)
+        max_cap = r3.number_input("Max Stock Cap", min_value=1, value=500, step=50)
+        dry_run_mode = r4.checkbox("🧪 Dry-Run Mode (Audit Only, No Live Submit)", value=True)
+
+        st.divider()
+        target_scope = st.radio(
+            "Target SKU Scope",
+            [
+                "1. Single SKU",
+                "2. Excel / CSV List of SKUs (.xlsx / .csv)",
+                "3. Full MySQL Database Catalog",
+            ],
+            horizontal=True,
+        )
+
+        target_skus_list = None
+        scope_ready = True
+
+        if target_scope.startswith("1."):
+            single_sku_in = st.text_input("Enter Single SKU *", placeholder="e.g., 006-000114-A")
+            if single_sku_in.strip():
+                target_skus_list = [single_sku_in.strip()]
+            else:
+                scope_ready = False
+
+        elif target_scope.startswith("2."):
+            sku_sheet = st.file_uploader("Upload Excel or CSV File Containing Target SKUs", type=["xlsx", "xls", "csv"], key="uf_sku_file")
+            if sku_sheet is not None:
+                df_skus = load_uploaded_spreadsheet(sku_sheet.getvalue(), sku_sheet.name)
+                sku_col = next(
+                    (c for c in df_skus.columns if str(c).strip().lower() in ("sku", "item", "item_code", "productsku")),
+                    df_skus.columns[0],
+                )
+                target_skus_list = [s for s in df_skus[sku_col].dropna().astype(str).str.strip().tolist() if s]
+                st.info(f"Loaded **{len(target_skus_list):,}** SKUs from column `{sku_col}` in `{sku_sheet.name}`.")
+            else:
+                scope_ready = False
+
+        else:
+            st.warning("Full MySQL Catalog selected — auditing all active SKUs against live Amazon SP-API may take several minutes due to SP-API rate limits (5 req/sec).")
+
+        if st.button("🔍 Step 1: Load from MySQL & Audit Against Live Amazon Listings", type="primary", disabled=not scope_ready):
+            try:
+                with st.spinner("Querying MySQL product records and applying stock buffer rules..."):
+                    mysql_products = fetch_products_for_amazon_feed(
+                        skus=target_skus_list,
+                        min_stock_cutoff=int(min_cutoff),
+                        max_stock_cap=int(max_cap),
+                        stock_source=stock_src,
+                    )
+
+                if not mysql_products:
+                    st.warning("No matching product records found in MySQL.")
+                else:
+                    prog_bar = st.progress(0, text=f"Auditing 0 / {len(mysql_products)} SKUs against live Amazon SP-API...")
+
+                    def _on_progress(cur: int, tot: int, cur_sku: str):
+                        prog_bar.progress(cur / tot, text=f"Auditing {cur} / {tot}: `{cur_sku}`")
+
+                    items_to_upd, report_df = audit_mysql_vs_live_amazon(
+                        products=mysql_products,
+                        seller_id=feed_seller_id,
+                        marketplace_id=feed_mkt_id,
+                        dry_run=dry_run_mode,
+                        update_type=update_type,
+                        progress_callback=_on_progress,
+                    )
+                    prog_bar.empty()
+
+                    st.session_state["uf_items_to_update"] = items_to_upd
+                    st.session_state["uf_report_df"] = report_df
+                    st.session_state["uf_total_examined"] = len(mysql_products)
+                    st.session_state["uf_update_type"] = update_type
+            except Exception as exc:
+                st.error(f"Audit failed: {exc}")
+
+        if "uf_report_df" in st.session_state:
+            rep_df: pd.DataFrame = st.session_state["uf_report_df"]
+            to_upd: list = st.session_state["uf_items_to_update"]
+            tot_ex: int = st.session_state["uf_total_examined"]
+            saved_utype: str = st.session_state["uf_update_type"]
+
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Total SKUs Examined", f"{tot_ex:,}")
+            m2.metric("SKUs with Pending Changes", f"{len(to_upd):,}")
+            m3.metric("SKUs Unchanged", f"{tot_ex - len(to_upd):,}")
+
+            st.dataframe(rep_df, use_container_width=True)
+
+            xlsx_buf = io.BytesIO()
+            with pd.ExcelWriter(xlsx_buf, engine="openpyxl") as writer:
+                rep_df.to_excel(writer, index=False, sheet_name="Amazon_Audit_Report")
+            st.download_button(
+                "⬇️ Download Excel Delta Report (`amazon_update_summary_report.xlsx`)",
+                data=xlsx_buf.getvalue(),
+                file_name="amazon_update_summary_report.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+            if len(to_upd) > 0:
+                if dry_run_mode:
+                    st.info("🧪 **Dry-Run Mode is active.** Uncheck *Dry-Run Mode* above to enable live bulk feed submission to Amazon.co.za.")
+                elif not can_sync_feed:
+                    st.warning("You require `sync_amazon_finances` or `can_live_sync` permission to submit live feeds to Amazon.")
+                else:
+                    if st.button(f"🚀 Step 2: Submit {len(to_upd):,} Updated SKU(s) via Bulk `JSON_LISTINGS_FEED`", type="primary"):
+                        try:
+                            batch_size = 1000
+                            submitted_feeds = []
+                            with st.spinner(f"Uploading and submitting bulk JSON_LISTINGS_FEED for {len(to_upd):,} SKU(s)..."):
+                                for i in range(0, len(to_upd), batch_size):
+                                    chunk = to_upd[i : i + batch_size]
+                                    feed_payload = build_universal_listings_feed(
+                                        products=chunk,
+                                        seller_id=feed_seller_id,
+                                        marketplace_id=feed_mkt_id,
+                                        update_type=saved_utype,
+                                    )
+                                    res = submit_bulk_json_listings_feed(
+                                        feed_content=feed_payload,
+                                        marketplace_id=feed_mkt_id,
+                                        triggered_by=current_user,
+                                    )
+                                    submitted_feeds.append(res)
+
+                            for sf in submitted_feeds:
+                                st.success(
+                                    f"Feed Submitted Successfully! **Feed ID:** `{sf['feed_id']}` | "
+                                    f"**Document ID:** `{sf['feed_document_id']}` | **SKUs:** `{sf['message_count']}`"
+                                )
+                        except Exception as exc:
+                            st.error(f"Bulk Feed Submission Failed: {exc}")
