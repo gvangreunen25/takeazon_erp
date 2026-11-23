@@ -30,7 +30,7 @@ st.set_page_config(
     page_title="Takeazon WMS & Omni-Channel ERP",
     page_icon="📦",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="auto",
 )
 
 bootstrap_app_startup()
@@ -132,94 +132,44 @@ if not permitted_modules:
 
 
 from core.ui_helpers import inject_global_theme
+from modules.hubs import HUB_DEFINITIONS, HUB_ROUTES, LEGACY_TO_HUB
 
 inject_global_theme()
 
-WORKSPACE_GROUPS = {
-    "🏠 Command & Analytics": [
-        "⚡ Operations Action Center",
-        "📊 Executive & Financial Analytics",
-    ],
-    "🛒 Channels, Pricing & Research": [
-        "🧭 Multi-Channel Wave Research",
-        "🛒 Channel Profitability & Listings",
-        "📥 Supplier Excel Import & Exclusions",
-    ],
-    "📦 Warehouse & Fulfilment": [
-        "🔍 Warehouse Operations (GRN, Picks, Cycle Counts)",
-        "🔫 Barcode Scan In / Out & Bins",
-        "🏷️ Barcode & Shipping Label Printer",
-        "🚚 The Courier Guy (Waybills & Tracking)",
-    ],
-    "⚙️ Finance & Admin": [
-        "💼 Xero Accounting Sync",
-        "🔐 Users, Roles & Granular Permissions",
-        "⚙️ DB Secrets, Credentials & Requirements",
-    ],
-}
+# Build the user's permitted 6-Hub list from their underlying module permissions
+available_hubs = []
+covered_modules = set()
+for hub_def in HUB_DEFINITIONS:
+    if any(m in permitted_modules for m in hub_def["members"]):
+        available_hubs.append(hub_def["label"])
+    covered_modules.update(hub_def["members"])
 
-# Build available workspace groups strictly from the logged-in user's permitted modules
-available_groups = {}
-assigned_set = set()
-for grp_name, grp_items in WORKSPACE_GROUPS.items():
-    allowed_in_grp = [m for m in grp_items if m in permitted_modules]
-    if allowed_in_grp:
-        available_groups[grp_name] = allowed_in_grp
-        assigned_set.update(allowed_in_grp)
-
-leftover = [m for m in permitted_modules if m not in assigned_set]
-if leftover:
-    available_groups["📌 Other Modules"] = leftover
-
-group_names = list(available_groups.keys())
+extra_modules = [m for m in permitted_modules if m not in covered_modules]
+all_nav_options = available_hubs + extra_modules
 
 # Reset navigation cleanly whenever the logged-in user session changes
 current_session_sig = f"{auth_user.get('username')}:{auth_user.get('role_id')}"
 if st.session_state.get("_nav_bound_user") != current_session_sig:
     st.session_state["_nav_bound_user"] = current_session_sig
-    st.session_state["active_workspace_group"] = group_names[0]
-    st.session_state["active_module_page"] = available_groups[group_names[0]][0]
+    st.session_state["active_hub_page"] = all_nav_options[0]
     st.session_state.pop("nav_override_page", None)
 
-# Handle intentional one-click cross-module navigation jumps
+# Handle one-click cross-module jumps (maps legacy screen names to their consolidated hub)
 if "nav_override_page" in st.session_state:
-    target_p = st.session_state.pop("nav_override_page")
-    if target_p in permitted_modules:
-        for grp_name, grp_items in available_groups.items():
-            if target_p in grp_items:
-                st.session_state["active_workspace_group"] = grp_name
-                st.session_state["active_module_page"] = target_p
-                break
+    raw_target = st.session_state.pop("nav_override_page")
+    mapped_target = LEGACY_TO_HUB.get(raw_target, raw_target)
+    if mapped_target in all_nav_options:
+        st.session_state["active_hub_page"] = mapped_target
 
-if st.session_state.get("active_workspace_group") not in available_groups:
-    st.session_state["active_workspace_group"] = group_names[0]
+if st.session_state.get("active_hub_page") not in all_nav_options:
+    st.session_state["active_hub_page"] = all_nav_options[0]
 
-
-def _on_workspace_change():
-    chosen_grp = st.session_state.get("active_workspace_group")
-    if chosen_grp in available_groups and available_groups[chosen_grp]:
-        st.session_state["active_module_page"] = available_groups[chosen_grp][0]
-
-
-st.sidebar.markdown("### 🧭 Workspace")
-selected_group = st.sidebar.selectbox(
-    "Department / Workspace",
-    options=group_names,
-    index=group_names.index(st.session_state["active_workspace_group"]),
-    key="active_workspace_group",
-    on_change=_on_workspace_change,
-    label_visibility="collapsed",
-)
-
-group_modules = available_groups[selected_group]
-if st.session_state.get("active_module_page") not in group_modules:
-    st.session_state["active_module_page"] = group_modules[0]
-
+st.sidebar.markdown("### 🧭 Navigation")
 page = st.sidebar.radio(
-    "Module",
-    options=group_modules,
-    index=group_modules.index(st.session_state["active_module_page"]),
-    key="active_module_page",
+    "Navigation",
+    options=all_nav_options,
+    index=all_nav_options.index(st.session_state["active_hub_page"]),
+    key="active_hub_page",
     label_visibility="collapsed",
 )
 
@@ -244,4 +194,7 @@ MODULE_ROUTES = {
     "🔐 Users, Roles & Granular Permissions": users_rbac.render,
 }
 
-MODULE_ROUTES[page](auth_user)
+if page in HUB_ROUTES:
+    HUB_ROUTES[page](auth_user, permitted_modules)
+else:
+    MODULE_ROUTES[page](auth_user)
